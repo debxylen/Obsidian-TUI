@@ -13,6 +13,7 @@ import base64
 import hashlib
 import asyncio
 import keyring
+import tempfile
 import mimetypes
 import subprocess
 
@@ -708,11 +709,9 @@ class ObsidianTUI(App):
                 res = await client.get(dl_url, headers=hdrs)
                 if res.status_code != 200: self.notify(f"Download failed for {filename} (HTTP {res.status_code})", severity="error"); return
 
-                os.makedirs("./attachments", exist_ok=True)
-                filepath = os.path.join(".", "attachments", filename)
-
-                with open(filepath, "wb") as f:
+                with tempfile.NamedTemporaryFile(delete=False, prefix=f"{os.path.splitext(filename)[0]}_", suffix=os.path.splitext(filename)[1]) as f:
                     f.write(res.content)
+                    filepath = f.name
 
                 self.notify(f"Opening {filename}...", severity="information")
 
@@ -973,7 +972,7 @@ class ObsidianTUI(App):
 
         inp = self.query_one("#message-input", MessageInput)
         txt = inp.text.strip()
-        if not txt: return
+        if not txt and not getattr(self, "pending_attachments"): return
 
         inp.text = ""
         scroll   = self.query_one("#chat-scroll", VerticalScroll)
@@ -1013,7 +1012,7 @@ class ObsidianTUI(App):
                 header_overrides=self.get_overrides(),
             )
 
-            async for line in generator:
+            async for line in generator: # type: ignore
                 line = line.strip()
                 if not line or not line.startswith("data:"): continue
 
@@ -1043,7 +1042,7 @@ class ObsidianTUI(App):
                             if val.get("conversation_id"): new_cid = val["conversation_id"]
 
                         elif op == "append" and "/content/parts/0" in p_path:
-                            if mid: text += val
+                            if isinstance(val, str) and mid: text += val
 
                         elif op == "patch" or (op == "append" and "/content" not in p_path):
                             if isinstance(val, str) and mid: text += val

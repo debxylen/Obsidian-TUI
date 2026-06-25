@@ -2,7 +2,10 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('style.tcss', '.'),],
+    datas=[
+        ('style.tcss', '.'),
+        ('favicon.ico', '.'),
+    ],
 
     hiddenimports=[
         'textual',
@@ -19,6 +22,10 @@ a = Analysis(
         'textual.reactive',
         'rich',
         'rich.markdown',
+
+        'PIL',
+        'PIL.Image',
+        'tkinter',
 
         'cffi',
         'curl_cffi',
@@ -38,7 +45,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter',
         'sqlite3',
         'unittest',
         'pydoc',

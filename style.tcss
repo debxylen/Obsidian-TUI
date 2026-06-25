@@ -91,22 +91,47 @@ Screen {
     align: left middle;
 }
 
+.-hidden {
+    display: none;
+}
+
+#temp-btn {
+    height: 3;
+    min-width: 5;
+    margin-right: 1;
+    background: #18181b;
+    color: #52525b;
+    border: none;
+    text-style: bold;
+}
+
+#temp-btn:hover {
+    color: #a1a1aa;
+}
+
+#temp-btn.-toggled {
+    color: #fca5a5;
+}
+
+#temp-btn.-toggled:hover {
+    color: #fecaca;
+}
+
 #copy-url-btn {
     height: 3;
     margin-right: 1;
-    background: #27272a;
-    color: #d4d4d8;
+    color: #52525b;
+    background: #18181b;
     border: none;
     min-width: 5;
 }
 
 #copy-url-btn:hover {
-    background: #3f3f46;
+    color: #d4d4d8;
 }
 
 #copy-url-btn:disabled {
-    background: #1c1c1f;
-    color: #52525b;
+    color: #3f3f46;
 }
 
 #chat-header {
@@ -212,10 +237,6 @@ ChatMessage {
     color: #ef4444;
     text-style: bold underline;
     width: auto;
-}
-
-#staged-attachments.-hidden {
-    display: none;
 }
 
 #message-input {
@@ -336,4 +357,41 @@ UploadScreen {
     background: #18181b;
     border: heavy #8b5cf6;
     padding: 1 2 0 2;
+}
+
+/* --- chat options --- */
+ChatOptionsScreen {
+    align: center middle;
+    background: rgba(0, 0, 0, 0.6);
+}
+
+#options-panel {
+    width: 40;
+    height: auto;
+    background: #18181b;
+    border: heavy #8b5cf6;
+    padding: 1 2;
+}
+
+#options-title {
+    text-style: bold;
+    color: #c084fc;
+    margin-bottom: 1;
+    content-align: center middle;
+}
+
+#options-panel Button {
+    width: 100%;
+    margin-top: 1;
+    border: none;
+    padding: 1;
+}
+
+#cancel-options-btn {
+    background: #27272a;
+    color: #d4d4d8;
+}
+
+#cancel-options-btn:hover {
+    background: #3f3f46;
 }

@@ -185,9 +185,9 @@ async def get_req_token(config):
 
 # --- stream chat --------------------------------------------------------------
 
-async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None, attachments=None):
+async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None, attachments=None, temp_chat=False, conduit_token=None):
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
-    
+
     async with AsyncSession(impersonate="chrome110") as s:
         dpl, scripts = await get_sentinel_data(s, cookies=cookies)
         conf = get_pow_config(ua, dpl, scripts)
@@ -221,26 +221,114 @@ async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=N
                         "height":        att.get("height", 600)
                     })
 
-        payload = {
-            "action": "next", "parent_message_id": parent_id or str(uuid.uuid4()),
-            "model": "auto", "timezone_offset_min": -480, "history_and_training_disabled": False,
-            "force_paragen": False, "force_rate_limit": False, "force_use_sse": True,
-            "messages": [{"id": message_id or str(uuid.uuid4()), "author": {"role": "user"}, "content": {"content_type": c_type, "parts": msg_parts}, "metadata": metadata}],
-            "conversation_mode": {"kind": "primary_assistant"}, "websocket_request_id": str(uuid.uuid4())
+        msg_meta = {"serialization_metadata": {"custom_symbol_offsets": []}}
+        if metadata: msg_meta.update(metadata)
+
+        msg_obj = {
+            "id":          message_id or str(uuid.uuid4()),
+            "author":      {"role": "user"},
+            "create_time": time.time(),
+            "content":     {"content_type": c_type, "parts": msg_parts},
+            "metadata":    msg_meta,
         }
+
+        if temp_chat:
+            payload = {
+                "action":                              "next",
+                "messages":                            [msg_obj],
+                "parent_message_id":                   parent_id or "client-created-root",
+                "model":                               "auto",
+                "client_prepare_state":                "success",
+                "timezone_offset_min":                 -480,
+                "timezone":                            "Asia/Shanghai",
+                "history_and_training_disabled":       True,
+                "conversation_mode":                   {"kind": "primary_assistant"},
+                "enable_message_followups":            True,
+                "system_hints":                        [],
+                "supports_buffering":                  True,
+                "supported_encodings":                 ["v1"],
+                "paragen_cot_summary_display_override": "allow",
+                "force_parallel_switch":               "auto",
+            }
+        else:
+            payload = {
+                "action":                        "next",
+                "parent_message_id":             parent_id or str(uuid.uuid4()),
+                "model":                         "auto",
+                "timezone_offset_min":           -480,
+                "history_and_training_disabled": False,
+                "force_paragen":                 False,
+                "force_rate_limit":              False,
+                "force_use_sse":                 True,
+                "messages":                      [msg_obj],
+                "conversation_mode":             {"kind": "primary_assistant"},
+                "websocket_request_id":          str(uuid.uuid4()),
+            }
 
         if conv_id: payload["conversation_id"] = conv_id
 
         h = get_headers(token, ua, cookies=cookies)
         h.update({'accept': 'text/event-stream', 'openai-sentinel-chat-requirements-token': data.get('token'), 'openai-sentinel-proof-token': proof})
 
-        resp = await s.post("https://chatgpt.com/backend-api/conversation", headers=h, json=payload, stream=True)
+        if conduit_token: h['x-conduit-token'] = conduit_token
+        else:
+            prep_payload = payload.copy()
+            prep_payload.pop("messages", None)
+            prep_payload.pop("websocket_request_id", None)
+
+            prep_h = dict(h)
+            prep_h['accept'] = '*/*'
+
+            prep_resp = await s.post("https://chatgpt.com/backend-api/f/conversation/prepare", headers=prep_h, json=prep_payload)
+            if prep_resp.status_code == 200:
+                new_token = prep_resp.json().get("conduit_token")
+                if new_token:
+                    h['x-conduit-token'] = new_token
+                    yield f"data: {{\"new_conduit\": \"{new_token}\"}}\n\n"
+
+        endpoint = "https://chatgpt.com/backend-api/f/conversation" if temp_chat else "https://chatgpt.com/backend-api/conversation"
+        resp = await s.post(endpoint, headers=h, json=payload, stream=True)
+
+        if resp.status_code != 200:
+            try: await resp.read()
+            except Exception: pass
+            yield f"data: {{\"message\": {{\"author\": {{\"role\": \"assistant\"}}, \"content\": {{\"content_type\": \"text\", \"parts\": [\"HTTP ERROR {resp.status_code}: {resp.text}\"]}}}}}}\n\n"
+            return
+
         async for line in resp.aiter_lines():
             line = line.decode("utf-8")
 
             if line.startswith("data: "):
                 if "[DONE]" in line: break
+
+                if "conversation_id" in line and temp_chat and not conv_id:
+                    try:
+                        d = json.loads(line[6:])
+                        if d.get("conversation_id") == None: raise Exception
+
+                        conv_id = d["conversation_id"]
+                        payload["conversation_id"] = conv_id
+
+                    except: pass
+
                 yield line + "\n\n"
+
+        if temp_chat and conv_id and h.get('x-conduit-token'):
+            try:
+                prep_payload = payload.copy()
+                prep_payload.pop("messages", None)
+                prep_payload.pop("partial_query", None)
+                prep_payload.pop("websocket_request_id", None)
+
+                prep_h = dict(h)
+                prep_h['accept'] = '*/*'
+
+                ka_resp = await s.post("https://chatgpt.com/backend-api/f/conversation/prepare", headers=prep_h, json=prep_payload)
+                if ka_resp.status_code == 200:
+                    ka_token = ka_resp.json().get("conduit_token")
+                    if ka_token: yield f"data: {{\"new_conduit\": \"{ka_token}\"}}\n\n"
+
+            except: pass
 
 # --- settings modal -----------------------------------------------------------
 
@@ -299,10 +387,36 @@ class StagedAttachmentLabel(Static):
     def on_click(self) -> None:
         self.app.remove_pending_attachment(self.att_id)
 
+class ChatOptionsScreen(ModalScreen):
+    def __init__(self, cid: str, title: str):
+        super().__init__()
+        self.cid   = cid
+        self.title = title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="options-panel"):
+            yield Label(f"Options: {self.title}", id="options-title")
+            yield Button("Delete Conversation", id="delete-chat-btn", variant="error")
+            yield Button("Cancel", id="cancel-options-btn")
+
+    @on(Button.Pressed, "#cancel-options-btn")
+    def on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#delete-chat-btn")
+    def on_delete(self) -> None:
+        self.dismiss(self.cid)
+
 class ConvItem(Static):
     class Selected(Message):
         def __init__(self, cid: str) -> None:
             self.cid = cid
+            super().__init__()
+
+    class RightClicked(Message):
+        def __init__(self, cid: str, title: str) -> None:
+            self.cid   = cid
+            self.title = title
             super().__init__()
 
     def __init__(self, label: str, cid: str, title: str, active: bool = False):
@@ -313,8 +427,9 @@ class ConvItem(Static):
         self.tooltip   = title
         self.can_focus = True
 
-    def on_click(self) -> None:
-        self.post_message(self.Selected(self.cid))
+    def on_click(self, event) -> None:
+        if event.button == 3: self.post_message(self.RightClicked(self.cid, self.title))
+        else: self.post_message(self.Selected(self.cid))
 
     def on_key(self, event) -> None:
         if event.key in ("enter", "space"): self.post_message(self.Selected(self.cid))
@@ -367,6 +482,7 @@ class ObsidianTUI(App):
         self.active_pid          = str(uuid.uuid4())
         self.stream_widget       = None
         self.pending_attachments = []
+        self.temporary           = False
 
     # --- layout ---------------------------------------------------------------
 
@@ -384,8 +500,9 @@ class ObsidianTUI(App):
 
             with Container(id="chat-area"):
                 with Horizontal(id="chat-header-container"):
-                    yield Static("No active conversation", id="chat-header")
-                    yield Button("📋", id="copy-url-btn")
+                    yield Static("New Conversation", id="chat-header")
+                    yield Button("∅", id="temp-btn")
+                    yield Button("🔗︎", id="copy-url-btn", classes="-hidden")
                 with VerticalScroll(id="chat-scroll"): pass
                 with Container(id="input-container"):
                     yield Horizontal(id="staged-attachments", classes="-hidden")
@@ -398,6 +515,7 @@ class ObsidianTUI(App):
 
     def on_mount(self) -> None:
         self.title = "Obsidian TUI"
+        self.draw_sidebar()
         if not self.cfg.get("token"): return self.action_open_settings()
         self.load_convs()
 
@@ -461,24 +579,78 @@ class ObsidianTUI(App):
 
         hdr  = self.query_one("#chat-header", Static)
         copy = self.query_one("#copy-url-btn", Button)
-        
-        if not self.active_cid:
+        temp = self.query_one("#temp-btn", Button)
+
+        is_new = (self.active_cid is None)
+
+        if is_new:
             hdr.update("New Conversation")
-            copy.disabled = True
+            copy.add_class("-hidden")
+            temp.remove_class("-hidden")
+
+            if self.temporary: temp.add_class("-toggled")
+            else: temp.remove_class("-toggled")
             return
 
-        title = "ChatGPT Conversation"
-        for item in self.convs:
-            if item.get("id") == self.active_cid:
-                title = item.get("title", title)
-                break
+        if self.temporary:
+            hdr.update("Chat: Temporary Conversation")
 
-        hdr.update(f"Chat: {title}")
-        copy.disabled = False
+            copy.add_class("-hidden")
+            temp.remove_class("-hidden")
+            temp.add_class("-toggled")
+
+        else:
+            title = "ChatGPT Conversation"
+            for item in self.convs:
+                if item.get("id") != self.active_cid: continue
+                title = item.get("title", title); break
+
+            hdr.update(f"Chat: {title}")
+            copy.remove_class("-hidden")
+            temp.add_class("-hidden")
+            copy.disabled = False
 
     @on(ConvItem.Selected)
     def on_sel(self, event: ConvItem.Selected) -> None:
+        self.temporary = False
         self.load_conv(event.cid)
+
+    @on(Button.Pressed, "#temp-btn")
+    def on_temp_btn(self) -> None:
+        if self.active_cid is None:
+            self.temporary = not self.temporary
+            self.draw_sidebar()
+
+    @on(ConvItem.RightClicked)
+    def on_conv_right_click(self, event: ConvItem.RightClicked) -> None:
+        def handle_result(cid: str | None) -> None:
+            if cid: self.delete_conversation(cid)
+        self.push_screen(ChatOptionsScreen(event.cid, event.title), handle_result)
+
+    @work
+    async def delete_conversation(self, cid: str) -> None:
+        url  = f"https://chatgpt.com/backend-api/conversation/{cid}"
+        hdrs = get_hdrs(self.cfg["token"], self.cfg["cookies"])
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.patch(url, headers=hdrs, json={"is_visible": False})
+
+                if res.status_code == 200 and res.json().get("success") is True:
+                    self.notify("Conversation deleted.", severity="information")
+
+                    if self.active_cid == cid:
+                        self.active_cid = None
+                        self.active_pid = str(uuid.uuid4())
+                        self.query_one("#chat-scroll", VerticalScroll).remove_children()
+                        self.query_one("#chat-header", Static).update("No active conversation")
+                    self.load_convs()
+
+                else:
+                    self.notify(f"Failed to delete conversation (HTTP {res.status_code})", severity="error")
+
+        except Exception as e:
+            self.notify(f"Error deleting conversation: {e}", severity="error")
 
     @on(Button.Pressed)
     def on_btn(self, event: Button.Pressed) -> None | Worker[None]:
@@ -804,6 +976,8 @@ class ObsidianTUI(App):
             scroll.mount(Label(f"Error loading details: {e}"))
 
     def action_submit_message(self) -> None:
+        if getattr(self, "is_streaming", False): return
+
         inp = self.query_one("#message-input", MessageInput)
         txt = inp.text.strip()
         if not txt: return
@@ -827,7 +1001,10 @@ class ObsidianTUI(App):
 
     @work(exclusive=True)
     async def stream_resp(self, prompt: str, attachments=None) -> None:
+        self.is_streaming = True
+
         text, mid, new_cid = "", "", self.active_cid
+        last_p, last_o = "", ""
 
         try:
             generator = stream_chat(
@@ -837,7 +1014,9 @@ class ObsidianTUI(App):
                 parent_id=self.active_pid,
                 message_id=str(uuid.uuid4()),
                 cookies=self.cfg["cookies"],
-                attachments=attachments
+                attachments=attachments,
+                temp_chat=self.temporary,
+                conduit_token=getattr(self, "conduit_token", None),
             )
 
             async for line in generator:
@@ -850,12 +1029,17 @@ class ObsidianTUI(App):
                 try:
                     data = json.loads(data_str)
                     if data.get("conversation_id"): new_cid = data["conversation_id"]
+                    if data.get("new_conduit"): self.conduit_token = data["new_conduit"]
 
-                    op, val = data.get("o"), data.get("v")
-                    p_path  = data.get("p") or ""
+                    op     = data.get("o", last_o)
+                    val    = data.get("v")
+                    p_path = data.get("p", last_p) or ""
 
-                    if data.get("p") is not None and op in ("add", "append", "patch"):
-                        if op == "add" and val and val.get("message"):
+                    if "o" in data: last_o = op
+                    if "p" in data: last_p = p_path
+
+                    if val is not None and op in ("add", "append", "patch"):
+                        if op == "add" and isinstance(val, dict) and val.get("message"):
                             mdata = val["message"]
                             if mdata.get("author", {}).get("role") != "assistant": continue
 
@@ -883,10 +1067,14 @@ class ObsidianTUI(App):
 
             if mid:     self.active_pid = mid
             if new_cid: self.active_cid = new_cid
-            self.load_convs()
+            if not self.temporary: self.load_convs()
+            else: self.draw_sidebar()
 
         except Exception as e:
             self.stream_widget.upd_content(f"\n*Exception: {e}*")
+
+        finally:
+            self.is_streaming = False
 
     def action_open_settings(self) -> None:
         def on_dismiss(new_cfg: dict[str, str] | None) -> None:
@@ -900,6 +1088,8 @@ class ObsidianTUI(App):
     def action_new_chat(self) -> None:
         self.active_cid = None
         self.active_pid = str(uuid.uuid4())
+        self.temporary = False
+        self.conduit_token = None
         
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.remove_children()

@@ -1,22 +1,31 @@
+# pyright: reportOptionalMemberAccess=warning, reportAttributeAccessIssue=warning, reportUnnecessaryTypeIgnoreComment=error
+
 import os
 import re
+import io
 import sys
 import json
 import time
 import uuid
-import json
 import httpx
 import random
 import base64
 import hashlib
 import asyncio
 import keyring
+import mimetypes
+import subprocess
+
+import tkinter as tk
+from PIL import Image
+from tkinter import filedialog
 
 from html.parser import HTMLParser
 from curl_cffi.requests import AsyncSession
 from datetime import datetime, timedelta, timezone
 
 from textual import on, work
+from textual.worker import Worker
 from rich.markdown import Markdown
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -126,7 +135,7 @@ class ScriptParser(HTMLParser):
         if "src" not in d: return
 
         self.scripts.append(d["src"])
-        m = re.search(r"c/[^/]*/_", d["src"])
+        m = re.search(r"c/[^/]*/_", d["src"]) # type: ignore
         if m: self.depl_path = m.group(0)
 
 async def get_sentinel_data(session, cookies=None):
@@ -176,7 +185,7 @@ async def get_req_token(config):
 
 # --- stream chat --------------------------------------------------------------
 
-async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None):
+async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None, attachments=None):
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
     
     async with AsyncSession(impersonate="chrome110") as s:
@@ -193,12 +202,30 @@ async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=N
         if pow_d.get('required'):
             ans, ok = solve_pow(pow_d.get('seed'), pow_d.get('difficulty'), conf)
             if ok: proof = "gAAAAAB" + ans
-        
+
+        msg_parts = [message]
+        metadata  = {}
+        c_type    = "text"
+
+        if attachments:
+            c_type = "multimodal_text"
+            metadata["attachments"] = attachments
+
+            for att in attachments:
+                if att.get("mime_type", "").startswith("image/"):
+                    msg_parts.append({
+                        "content_type":  "image_asset_pointer",
+                        "asset_pointer": f"file-service://{att['id']}",
+                        "size_bytes":    att.get("size", 0),
+                        "width":         att.get("width", 800),
+                        "height":        att.get("height", 600)
+                    })
+
         payload = {
             "action": "next", "parent_message_id": parent_id or str(uuid.uuid4()),
             "model": "auto", "timezone_offset_min": -480, "history_and_training_disabled": False,
             "force_paragen": False, "force_rate_limit": False, "force_use_sse": True,
-            "messages": [{"id": message_id or str(uuid.uuid4()), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [message]}}],
+            "messages": [{"id": message_id or str(uuid.uuid4()), "author": {"role": "user"}, "content": {"content_type": c_type, "parts": msg_parts}, "metadata": metadata}],
             "conversation_mode": {"kind": "primary_assistant"}, "websocket_request_id": str(uuid.uuid4())
         }
 
@@ -249,6 +276,10 @@ class SettingsScreen(ModalScreen[dict[str, str]]):
 # --- components ---------------------------------------------------------------
 
 class MessageInput(TextArea):
+    BINDINGS = [
+        ("ctrl+u", "app.upload_file", "Upload File"),
+    ]
+
     def on_key(self, event) -> None:
         if event.key == "enter":
             event.prevent_default()
@@ -258,6 +289,15 @@ class MessageInput(TextArea):
         if event.key in ("shift+enter", "ctrl+enter", "ctrl+j"):
             event.prevent_default()
             self.insert("\n")
+            return
+
+class StagedAttachmentLabel(Static):
+    def __init__(self, filename: str, att_id: str):
+        super().__init__(filename, classes="staged-att")
+        self.att_id = att_id
+
+    def on_click(self) -> None:
+        self.app.remove_pending_attachment(self.att_id)
 
 class ConvItem(Static):
     class Selected(Message):
@@ -280,11 +320,12 @@ class ConvItem(Static):
         if event.key in ("enter", "space"): self.post_message(self.Selected(self.cid))
 
 class ChatMessage(Container):
-    def __init__(self, sender: str, content: str, is_ai: bool, **kwargs):
+    def __init__(self, sender: str, content: str, is_ai: bool, attachments=None, **kwargs):
         super().__init__(**kwargs)
-        self.sender  = sender
-        self.content = content
-        self.is_ai   = is_ai
+        self.sender      = sender
+        self.content     = content
+        self.is_ai       = is_ai
+        self.attachments = attachments or []
 
     def compose(self) -> ComposeResult:
         cls = "user-msg" if not self.is_ai else "assistant-msg"
@@ -292,6 +333,13 @@ class ChatMessage(Container):
             hdr_cls = "user-msg-header" if not self.is_ai else "assistant-msg-header"
             yield Label(f" {self.sender} ", classes=f"message-header {hdr_cls}")
             yield Static(Markdown(self.content) if self.is_ai else self.content, classes=f"message-body {cls}-body")
+
+            if self.attachments:
+                with Horizontal(classes="attachments-container"):
+                    for att in self.attachments:
+                        btn = Button(f"📎 {att['name']}", classes="attachment-btn", id=f"att_{att['id'].replace('-', '_').replace(':', '_').replace('.', '_')}")
+                        btn.attachment_info = att
+                        yield btn
 
     def upd_content(self, txt: str) -> None:
         self.content = txt
@@ -307,16 +355,18 @@ class ObsidianTUI(App):
     BINDINGS = [
         ("ctrl+s", "open_settings", "Settings"),
         ("ctrl+n", "new_chat", "New Chat"),
+        ("ctrl+u", "upload_file", "Upload File"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
     def __init__(self):
         super().__init__()
-        self.cfg           = load_cfg()
-        self.convs         = []
-        self.active_cid    = None
-        self.active_pid    = str(uuid.uuid4())
-        self.stream_widget = None
+        self.cfg                 = load_cfg()
+        self.convs               = []
+        self.active_cid          = None
+        self.active_pid          = str(uuid.uuid4())
+        self.stream_widget       = None
+        self.pending_attachments = []
 
     # --- layout ---------------------------------------------------------------
 
@@ -338,8 +388,11 @@ class ObsidianTUI(App):
                     yield Button("📋", id="copy-url-btn")
                 with VerticalScroll(id="chat-scroll"): pass
                 with Container(id="input-container"):
-                    yield MessageInput(placeholder="Type message here... (Enter to send, Shift+Enter/Ctrl+Enter for newline)", id="message-input")
-                    yield Button("Send", id="send-btn")
+                    yield Horizontal(id="staged-attachments", classes="-hidden")
+                    with Horizontal(id="input-row"):
+                        yield Button("+", id="upload-btn")
+                        yield MessageInput(placeholder="Type message here... (Enter to send, Shift+Enter/Ctrl+Enter for newline)", id="message-input")
+                        yield Button("Send", id="send-btn")
 
         yield Footer()
 
@@ -428,7 +481,7 @@ class ObsidianTUI(App):
         self.load_conv(event.cid)
 
     @on(Button.Pressed)
-    def on_btn(self, event: Button.Pressed) -> None:
+    def on_btn(self, event: Button.Pressed) -> None | Worker[None]:
         btn, bid = event.button, event.button.id or ""
         
         if hasattr(btn, "cid"):          return self.load_conv(btn.cid)
@@ -436,11 +489,220 @@ class ObsidianTUI(App):
         if bid == "settings-btn":        return self.action_open_settings()
         if bid == "send-btn":            return self.action_submit_message()
         if bid == "copy-url-btn":        return self.action_copy_url()
+        if bid.startswith("att_"):       return self.action_open_attachment(btn)
 
     def action_copy_url(self) -> None:
         if not self.active_cid: return
         self.copy_to_clipboard(f"https://chatgpt.com/c/{self.active_cid}")
-        self.notify("Copied conversation URL to clipboard!", severity="info")
+        self.notify("Copied conversation URL to clipboard!", severity="information")
+
+    @work
+    async def action_open_attachment(self, btn: Button) -> None:
+        att = getattr(btn, "attachment_info", None)
+        if not att: return
+
+        self.notify(f"Downloading {att['name']}...", severity="information")
+
+        base_url = "https://chatgpt.com/backend-api"
+        cookie   = self.cfg["cookies"].replace("^%", "%").replace("^&", "&").replace("^\"", "\"")
+        hdrs     = get_headers(self.cfg["token"], cookies=cookie)
+
+        file_id  = att.get("id")
+        conv_id  = self.active_cid
+
+        filename = att.get("name")
+        dl_url   = None
+        last_err = ""
+
+        try:
+            async with AsyncSession(impersonate="chrome110") as client:
+
+                if att.get("type") == "sandbox":
+                    url    = f"{base_url}/conversation/{conv_id}/interpreter/download"
+                    params = {"message_id": att.get("message_id"), "sandbox_path": att.get("sandbox_path")}
+                    res    = await client.get(url, headers=hdrs, params=params)
+
+                    if res.status_code == 200: dl_url = res.json().get("download_url")
+                    else: last_err = f"Interpreter HTTP {res.status_code}: {res.text[:120]}"
+
+                else:
+                    url = f"{base_url}/conversation/{conv_id}/attachment/{file_id}/download"
+                    res = await client.get(url, headers=hdrs)
+
+                    if res.status_code == 200: dl_url = res.json().get("download_url")
+                    else:
+                        last_err = f"Attachment HTTP {res.status_code}: {res.text[:120]}"
+                        url = f"{base_url}/files/{file_id}/download"
+                        res = await client.get(url, headers=hdrs)
+
+                        if res.status_code == 200: dl_url = res.json().get("download_url")
+                        else: last_err += f" | Files HTTP {res.status_code}: {res.text[:120]}"
+
+                if not dl_url: self.notify(f"No download URL for {filename}. {last_err}", severity="error"); return
+
+                res = await client.get(dl_url, headers=hdrs)
+                if res.status_code != 200: self.notify(f"Download failed for {filename} (HTTP {res.status_code})", severity="error"); return
+
+                os.makedirs("./attachments", exist_ok=True)
+                filepath = os.path.join(".", "attachments", filename)
+
+                with open(filepath, "wb") as f:
+                    f.write(res.content)
+
+                self.notify(f"Opening {filename}...", severity="information")
+
+                if sys.platform == 'win32':    os.startfile(filepath)
+                elif sys.platform == 'darwin': subprocess.run(["open", filepath], check=False)
+                else: subprocess.run(["xdg-open", filepath], check=False)
+
+        except Exception as e:
+            self.notify(f"Error opening attachment: {e}", severity="error")
+
+    @work
+    async def action_upload_file(self) -> None:
+        loop = asyncio.get_event_loop()
+        filepath = await loop.run_in_executor(None, self.filepicker)
+        if filepath: self.upload_attachment(filepath)
+
+    @on(Button.Pressed, "#upload-btn")
+    def on_upload_btn(self) -> None:
+        self.action_upload_file()
+
+    def filepicker(self) -> str:
+        root = tk.Tk()
+        
+        icon_path = resource_path("favicon.ico")
+        if os.path.exists(icon_path):
+            try: root.iconbitmap(icon_path)
+            except Exception: pass
+        
+        root.overrideredirect(True)
+        root.attributes("-alpha", 0.0)
+
+        root.update_idletasks()
+        root.deiconify()
+        root.lift()
+        root.attributes("-topmost", True)
+
+        path = filedialog.askopenfilename(parent=root, initialdir=os.getcwd(), title="Select file to upload")
+        root.destroy()
+        return path or ""
+
+    @work
+    async def upload_attachment(self, filepath: str) -> None:
+        if not os.path.exists(filepath):
+            self.notify(f"File not found: {filepath}", severity="error"); return
+
+        filename = os.path.basename(filepath)
+        size     = os.path.getsize(filepath)
+        self.notify(f"Uploading {filename} ({size} bytes)...", severity="information")
+
+        mime_type, _ = mimetypes.guess_type(filepath)
+        mime_type    = mime_type or "application/octet-stream"
+        use_case     = "multimodal" if mime_type.startswith("image/") else "my_files"
+
+        try:
+            with open(filepath, "rb") as f: content = f.read()
+        except Exception as e:
+            self.notify(f"Failed to read file: {e}", severity="error")
+            return
+
+        base_url = "https://chatgpt.com/backend-api"
+        cookie   = self.cfg["cookies"].replace("^%", "%").replace("^&", "&").replace("^\"", "\"")
+        hdrs     = get_headers(self.cfg["token"], cookies=cookie)
+
+        try:
+            async with AsyncSession(impersonate="chrome110") as client:
+                payload = {
+                    "file_name":           filename,
+                    "file_size":           size,
+                    "use_case":            use_case,
+                    "reset_rate_limits":   False,
+                    "timezone_offset_min": -480
+                }
+
+                res = await client.post(f"{base_url}/files", headers=hdrs, json=payload)
+                if res.status_code != 200: self.notify(f"Failed to register file (HTTP {res.status_code}): {res.text[:100]}", severity="error"); return
+
+                resp_json  = res.json()
+                file_id    = resp_json.get("file_id")
+                upload_url = resp_json.get("upload_url")
+                
+                if not file_id or not upload_url:
+                    self.notify("Failed to retrieve upload parameters", severity="error"); return
+
+                put_hdrs = {
+                    "content-type":   mime_type,
+                    "x-ms-blob-type": "BlockBlob",
+                    "x-ms-version":   "2020-04-08",
+                }
+
+                res = await client.put(upload_url, headers=put_hdrs, data=content)
+                if res.status_code not in (200, 201): self.notify(f"Content upload failed (HTTP {res.status_code}): {res.text[:100]}", severity="error"); return
+
+                res = await client.post(f"{base_url}/files/{file_id}/uploaded", headers=hdrs, json={})
+                if res.status_code != 200: self.notify(f"Failed to complete upload (HTTP {res.status_code}): {res.text[:100]}", severity="error"); return
+
+                if use_case != "multimodal":
+                    success = False
+
+                    for _ in range(30):
+                        res = await client.get(f"{base_url}/files/{file_id}", headers=hdrs)
+                        if res.status_code == 200:
+                            status = res.json().get("retrieval_index_status")
+
+                            if status == "success":   success = True; break
+                            elif status == "failed":  break
+
+                        await asyncio.sleep(1)
+
+                    if not success:
+                        self.notify(f"File index verification timed out or failed", severity="warning")
+
+                width, height = 800, 600
+                if mime_type.startswith("image/"):
+                    img, bio = None, None
+
+                    try:
+                        bio = io.BytesIO(content)
+                        img = Image.open(bio)
+                        img.load()
+                        width, height = img.size
+                    finally:
+                        if img: img.close()
+                        if bio: bio.close()
+
+                self.pending_attachments.append({
+                    "id":        file_id,
+                    "name":      filename,
+                    "size":      size,
+                    "mime_type": mime_type,
+                    "width":     width,
+                    "height":    height
+                })
+
+                self.call_after_refresh(self.update_staged_ui)
+                self.notify(f"Successfully staged {filename}!", severity="information")
+
+        except Exception as e:
+            self.notify(f"Upload error: {e}", severity="error")
+
+    def remove_pending_attachment(self, att_id: str) -> None:
+        self.pending_attachments = [a for a in self.pending_attachments if a["id"] != att_id]
+        self.update_staged_ui()
+
+    def update_staged_ui(self) -> None:
+        container = self.query_one("#staged-attachments", Horizontal)
+        container.query("*").remove()
+
+        if not self.pending_attachments: container.add_class("-hidden"); return
+        else: container.remove_class("-hidden")
+
+        container.mount(Static("Staged: "))
+
+        for i, att in enumerate(self.pending_attachments):
+            if i > 0: container.mount(Static(", "))
+            container.mount(StagedAttachmentLabel(att["name"], att["id"]))
 
     @work(exclusive=True)
     async def load_conv(self, cid: str) -> None:
@@ -478,15 +740,62 @@ class ObsidianTUI(App):
 
                     if role not in ("user", "assistant") or not parts or hidden: continue
 
+                    atts, metadata = [], msg.get("metadata", {})
+                    for att in metadata.get("attachments", []):
+                        atts.append({
+                            "id":        att.get("id"),
+                            "name":      att.get("name") or "unnamed_file",
+                            "mime_type": att.get("mime_type") or "application/octet-stream",
+                            "type":      "file"
+                        })
+
+                    for p in parts:
+                        if isinstance(p, dict):
+                            c_type    = p.get("content_type")
+                            asset_ptr = p.get("asset_pointer") or ""
+                            if not (c_type == "image_asset_pointer" or asset_ptr.startswith("file-service://") or asset_ptr.startswith("sediment://")): continue
+
+                            f_id = asset_ptr.replace("file-service://", "").replace("sediment://", "")
+                            if not (f_id and not any(a["id"] == f_id for a in atts)): continue
+
+                            atts.append({
+                                "id":        f_id,
+                                "name":      p.get("name") or f"image_{f_id[:8]}.png",
+                                "mime_type": p.get("mime_type") or "image/png",
+                                "type":      "file"
+                            })
+
+                        elif isinstance(p, str):
+                            matches = re.findall(r'\(sandbox:([^\)]+)\)', p)
+
+                            for path in matches:
+                                name = os.path.basename(path)
+                                if any(a.get("sandbox_path") == path for a in atts): continue
+
+                                atts.append({
+                                    "id":           f"sandbox_{msg.get('id')}_{name}",
+                                    "name":         name,
+                                    "mime_type":    "application/octet-stream",
+                                    "type":         "sandbox",
+                                    "sandbox_path": path,
+                                    "message_id":   msg.get("id")
+                                })
+
                     txt = "".join([p for p in parts if isinstance(p, str)]).strip()
-                    if txt: thread.append({"id": msg.get("id"), "role": role, "content": txt})
+                    if txt or atts:
+                        thread.append({
+                            "id":          msg.get("id"),
+                            "role":        role,
+                            "content":     txt,
+                            "attachments": atts
+                        })
 
                 thread.reverse()
                 self.active_pid = thread[-1]["id"] if thread else str(uuid.uuid4())
 
                 for msg in thread:
                     sender = "You" if msg["role"] == "user" else "ChatGPT"
-                    scroll.mount(ChatMessage(sender, msg["content"], msg["role"] == "assistant"))
+                    scroll.mount(ChatMessage(sender, msg["content"], msg["role"] == "assistant", attachments=msg.get("attachments")))
                 
                 scroll.scroll_end(animate=False)
 
@@ -504,16 +813,20 @@ class ObsidianTUI(App):
 
         for node in scroll.query(".loading-msg"): node.remove()
 
-        scroll.mount(ChatMessage("You", txt, is_ai=False))
+        atts = getattr(self, "pending_attachments", [])
+        self.pending_attachments = []
+        self.update_staged_ui()
+
+        scroll.mount(ChatMessage("You", txt, is_ai=False, attachments=atts))
 
         self.stream_widget = ChatMessage("ChatGPT", "...", is_ai=True)
         scroll.mount(self.stream_widget)
         scroll.scroll_end()
 
-        self.stream_resp(txt)
+        self.stream_resp(txt, attachments=atts)
 
     @work(exclusive=True)
-    async def stream_resp(self, prompt: str) -> None:
+    async def stream_resp(self, prompt: str, attachments=None) -> None:
         text, mid, new_cid = "", "", self.active_cid
 
         try:
@@ -523,7 +836,8 @@ class ObsidianTUI(App):
                 conv_id=self.active_cid,
                 parent_id=self.active_pid,
                 message_id=str(uuid.uuid4()),
-                cookies=self.cfg["cookies"]
+                cookies=self.cfg["cookies"],
+                attachments=attachments
             )
 
             async for line in generator:
@@ -575,7 +889,8 @@ class ObsidianTUI(App):
             self.stream_widget.upd_content(f"\n*Exception: {e}*")
 
     def action_open_settings(self) -> None:
-        def on_dismiss(new_cfg: dict[str, str]) -> None:
+        def on_dismiss(new_cfg: dict[str, str] | None) -> None:
+            if new_cfg == None: return
             self.cfg = new_cfg
             save_cfg(new_cfg)
             self.load_convs()

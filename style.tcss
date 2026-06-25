@@ -286,7 +286,7 @@ SettingsScreen {
 
 #settings-panel {
     width: 62;
-    height: 20;
+    height: 30;
     background: #18181b;
     border: heavy #8b5cf6;
     padding: 1 2 0 2;
@@ -311,6 +311,10 @@ SettingsScreen {
 
 .settings-input:focus {
     border: tall #8b5cf6;
+}
+
+.settings-textarea {
+    height: 6;
 }
 
 #settings-actions {

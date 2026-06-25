@@ -65,8 +65,9 @@ def set(key: str, value: str):
 
 def load_cfg() -> dict[str, str]:
     return {
-        "token": get("TOKEN") or "",
-        "cookies": get("COOKIES") or "",
+        "token":            get("TOKEN")            or "",
+        "cookies":          get("COOKIES")          or "",
+        "header_overrides": get("HEADER_OVERRIDES") or "",
     }
 
 def save_cfg(cfg: dict[str, str]):
@@ -82,43 +83,18 @@ def resource_path(relative_path):
 
 # --- headers ------------------------------------------------------------------
 
-def get_hdrs(token: str, cookie: str) -> dict[str, str]:
-    h = {"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"}
-
-    if token:  h["authorization"] = f"Bearer {token}"
-    if cookie: h["cookie"]        = cookie.replace("^%", "%").replace("^&", "&").replace("^\"", "\"")
-
-    return h
-
-def get_headers(token=None, ua=None, cookies=None):
+def get_headers(token=None, ua=None, cookies=None, overrides=None):
     headers = {
         'accept':                      '*/*',
         'accept-language':             'en-PH,en-GB;q=0.9,en-US;q=0.8,en;q=0.7,fil;q=0.6',
-        'cache-control':               'no-cache',
         'oai-client-build-number':     '4480993',
         'oai-client-version':          'prod-7c2e8d83df2cf0b6eaa11ba7b37f1605384da182',
         'oai-device-id':               'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx',
-        'oai-language':                'en-US',
-        'pragma':                      'no-cache',
-        'origin':                      'https://chatgpt.com',
-        'priority':                    'u=1, i',
-        'referer':                     'https://chatgpt.com/',
-        'sec-ch-ua':                   '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-        'sec-ch-ua-arch':              '"x86"',
-        'sec-ch-ua-bitness':           '"64"',
-        'sec-ch-ua-full-version':      '"144.0.7559.133"',
-        'sec-ch-ua-full-version-list': '"Not(A:Brand";v="8.0.0.0", "Chromium";v="144.0.7559.133", "Google Chrome";v="144.0.7559.133"',
-        'sec-ch-ua-mobile':            '?0',
-        'sec-ch-ua-model':             '""',
-        'sec-ch-ua-platform':          '"Windows"',
-        'sec-ch-ua-platform-version':  '"10.0.0"',
-        'sec-fetch-dest':              'empty',
-        'sec-fetch-mode':              'cors',
-        'sec-fetch-site':              'same-origin',
         'user-agent':                  ua or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
     }
-    if token:   headers['authorization'] = f'Bearer {token}'
-    headers['cookie'] = cookies if cookies else 'oai-did=xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+    if token: headers['authorization'] = f'Bearer {token}'
+    if overrides: headers.update(overrides)
+
     return headers
 
 # --- sentinel stuff -----------------------------------------------------------
@@ -185,7 +161,7 @@ async def get_req_token(config):
 
 # --- stream chat --------------------------------------------------------------
 
-async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None, attachments=None, temp_chat=False, conduit_token=None):
+async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=None, cookies=None, attachments=None, temp_chat=False, conduit_token=None, header_overrides=None):
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
     async with AsyncSession(impersonate="chrome110") as s:
@@ -193,7 +169,7 @@ async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=N
         conf = get_pow_config(ua, dpl, scripts)
         
         p_tok = await get_req_token(conf)
-        res = await s.post("https://chatgpt.com/backend-api/sentinel/chat-requirements", headers=get_headers(token, ua, cookies=cookies), json={'p': p_tok})
+        res = await s.post("https://chatgpt.com/backend-api/sentinel/chat-requirements", headers=get_headers(token, ua, cookies=cookies, overrides=header_overrides), json={'p': p_tok})
         if res.status_code != 200: yield f"Error: {res.text}"; return
             
         data, proof = res.json(), None
@@ -267,7 +243,7 @@ async def stream_chat(token, message, conv_id=None, parent_id=None, message_id=N
 
         if conv_id: payload["conversation_id"] = conv_id
 
-        h = get_headers(token, ua, cookies=cookies)
+        h = get_headers(token, ua, cookies=cookies, overrides=header_overrides)
         h.update({'accept': 'text/event-stream', 'openai-sentinel-chat-requirements-token': data.get('token'), 'openai-sentinel-proof-token': proof})
 
         if conduit_token: h['x-conduit-token'] = conduit_token
@@ -340,12 +316,15 @@ class SettingsScreen(ModalScreen[dict[str, str]]):
     def compose(self) -> ComposeResult:
         with Container(id="settings-panel"):
             yield Label("Obsidian TUI Settings", classes="settings-title")
-            
+
             yield Label("ChatGPT Access Token:", classes="settings-label")
             yield Input(self.cfg.get("token", ""), id="token-input", placeholder="ey...", classes="settings-input")
 
             yield Label("Browser Cookies (optional):", classes="settings-label")
             yield Input(self.cfg.get("cookies", ""), id="cookies-input", placeholder="oai-did=...", classes="settings-input")
+
+            yield Label("Header Overrides (JSON, optional):", classes="settings-label")
+            yield TextArea(self.cfg.get("header_overrides", ""), id="header-overrides-input", classes="settings-input settings-textarea")
 
             with Horizontal(id="settings-actions"):
                 yield Button("Cancel", id="cancel-btn", classes="settings-btn")
@@ -353,9 +332,16 @@ class SettingsScreen(ModalScreen[dict[str, str]]):
 
     @on(Button.Pressed, "#save-btn")
     def on_save(self) -> None:
-        tok  = self.query_one("#token-input", Input).value.strip()
-        cook = self.query_one("#cookies-input", Input).value.strip()
-        self.dismiss({"token": tok, "cookies": cook})
+        tok       = self.query_one("#token-input", Input).value.strip()
+        cook      = self.query_one("#cookies-input", Input).value.strip()
+        overrides = self.query_one("#header-overrides-input", TextArea).text.strip()
+
+        if overrides:
+            try: json.loads(overrides)
+            except json.JSONDecodeError as e:
+                self.notify(f"Invalid JSON in Header Overrides: {e}", severity="error"); return
+
+        self.dismiss({"token": tok, "cookies": cook, "header_overrides": overrides})
 
     @on(Button.Pressed, "#cancel-btn")
     def on_cancel(self) -> None:
@@ -521,12 +507,19 @@ class ObsidianTUI(App):
 
     # --- funcs ----------------------------------------------------------------
 
+    def get_overrides(self) -> dict | None:
+        raw = self.cfg.get("header_overrides", "").strip()
+        if not raw: return None
+
+        try:    return json.loads(raw)
+        except: return None
+
     @work(exclusive=True)
     async def load_convs(self) -> None:
         if not self.cfg.get("token"): return
 
         url  = "https://chatgpt.com/backend-api/conversations?offset=0&limit=40&order=updated&is_archived=false"
-        hdrs = get_hdrs(self.cfg["token"], self.cfg["cookies"])
+        hdrs = get_headers(self.cfg["token"], None, self.cfg["cookies"], overrides=self.get_overrides())
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -630,7 +623,7 @@ class ObsidianTUI(App):
     @work
     async def delete_conversation(self, cid: str) -> None:
         url  = f"https://chatgpt.com/backend-api/conversation/{cid}"
-        hdrs = get_hdrs(self.cfg["token"], self.cfg["cookies"])
+        hdrs = get_headers(self.cfg["token"], None, self.cfg["cookies"], overrides=self.get_overrides())
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -677,7 +670,7 @@ class ObsidianTUI(App):
 
         base_url = "https://chatgpt.com/backend-api"
         cookie   = self.cfg["cookies"].replace("^%", "%").replace("^&", "&").replace("^\"", "\"")
-        hdrs     = get_headers(self.cfg["token"], cookies=cookie)
+        hdrs     = get_headers(self.cfg["token"], cookies=cookie, overrides=self.get_overrides())
 
         file_id  = att.get("id")
         conv_id  = self.active_cid
@@ -781,7 +774,7 @@ class ObsidianTUI(App):
 
         base_url = "https://chatgpt.com/backend-api"
         cookie   = self.cfg["cookies"].replace("^%", "%").replace("^&", "&").replace("^\"", "\"")
-        hdrs     = get_headers(self.cfg["token"], cookies=cookie)
+        hdrs     = get_headers(self.cfg["token"], cookies=cookie, overrides=self.get_overrides())
 
         try:
             async with AsyncSession(impersonate="chrome110") as client:
@@ -882,7 +875,7 @@ class ObsidianTUI(App):
         self.draw_sidebar()
 
         url  = f"https://chatgpt.com/backend-api/conversation/{cid}"
-        hdrs = get_hdrs(self.cfg["token"], self.cfg["cookies"])
+        hdrs = get_headers(self.cfg["token"], None, self.cfg["cookies"], overrides=self.get_overrides())
 
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.remove_children()
@@ -1017,6 +1010,7 @@ class ObsidianTUI(App):
                 attachments=attachments,
                 temp_chat=self.temporary,
                 conduit_token=getattr(self, "conduit_token", None),
+                header_overrides=self.get_overrides(),
             )
 
             async for line in generator:
@@ -1097,5 +1091,8 @@ class ObsidianTUI(App):
         self.draw_sidebar()
 
 if __name__ == "__main__":
+    sys.stderr.write(f"\033]0;{ "Obsidian" }\007")
+    sys.stderr.flush()
+
     app = ObsidianTUI()
     app.run()
